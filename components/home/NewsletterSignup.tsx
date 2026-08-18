@@ -1,9 +1,12 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 
 import Button from "@/components/Button";
+import SubmissionError from "@/components/forms/SubmissionError";
+import { submitPublicForm } from "@/lib/forms/client";
+import type { PublicFormFailure } from "@/lib/forms/contracts";
 
 /** Path to the lead-magnet PDF in /public. */
 const CHECKLIST_PATH = "/alchemy-brand-checklist.pdf";
@@ -32,52 +35,42 @@ function pushDataLayer(event: Record<string, unknown>) {
 
 export default function NewsletterSignup({ location = "homepage" }: Props) {
   const [status, setStatus] = useState<Status>("idle");
-  const [serverError, setServerError] = useState<string | null>(null);
+  const [failure, setFailure] = useState<PublicFormFailure | null>(null);
   const [errors, setErrors] = useState<FieldErrors>({});
+  const errorRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (status === "error") errorRef.current?.focus();
+  }, [status]);
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const form = event.currentTarget;
     setStatus("submitting");
     setErrors({});
-    setServerError(null);
+    setFailure(null);
 
-    const data = new FormData(event.currentTarget);
+    const data = new FormData(form);
     const payload = {
       email: String(data.get("email") ?? ""),
       consent: data.get("consent") === "on",
       company: String(data.get("company") ?? ""),
     };
 
-    try {
-      const res = await fetch("/api/newsletter", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const body = (await res.json()) as {
-        ok?: boolean;
-        error?: string;
-        fields?: FieldErrors;
-      };
-
-      if (!res.ok || body.error) {
-        setStatus("error");
-        if (body.fields) setErrors(body.fields);
-        setServerError(body.error ?? "Something went wrong. Please try again.");
-        return;
-      }
-
-      pushDataLayer({ event: "newsletter_signup", form_location: location });
-      setStatus("success");
-      event.currentTarget.reset();
-    } catch (err) {
+    const result = await submitPublicForm<keyof FieldErrors>(
+      "/api/newsletter",
+      payload,
+    );
+    if (!result.ok) {
       setStatus("error");
-      setServerError(
-        err instanceof Error
-          ? err.message
-          : "Couldn't sign you up just then. Please try again.",
-      );
+      setFailure(result);
+      setErrors(result.error.fields ?? {});
+      return;
     }
+
+    pushDataLayer({ event: "newsletter_signup", form_location: location });
+    setStatus("success");
+    form.reset();
   }
 
   return (
@@ -141,6 +134,7 @@ export default function NewsletterSignup({ location = "homepage" }: Props) {
                 onSubmit={onSubmit}
                 className="rounded-card bg-dawn-80 border border-dawn-60 p-7 space-y-5"
                 noValidate
+                aria-busy={status === "submitting"}
               >
                 <div>
                   <label htmlFor="newsletter-email" className={labelBase}>
@@ -212,13 +206,12 @@ export default function NewsletterSignup({ location = "homepage" }: Props) {
                   </label>
                 </div>
 
-                {serverError ? (
-                  <p
-                    role="alert"
+                {failure ? (
+                  <SubmissionError
+                    ref={errorRef}
+                    failure={failure}
                     className="text-[0.875rem] text-dragon-fire bg-dawn rounded-card p-3 border border-dragon-fire/40"
-                  >
-                    {serverError}
-                  </p>
+                  />
                 ) : null}
 
                 <Button
@@ -227,7 +220,11 @@ export default function NewsletterSignup({ location = "homepage" }: Props) {
                   disabled={status === "submitting"}
                   className="w-full"
                 >
-                  {status === "submitting" ? "Sending…" : "Send me the checklist"}
+                  {status === "submitting"
+                    ? "Sending…"
+                    : status === "error"
+                      ? "Try again"
+                      : "Send me the checklist"}
                 </Button>
               </form>
             )}

@@ -1,0 +1,31 @@
+name: Public form delivery
+
+on:
+  pull_request:
+    paths:
+      - "app/api/audit/**"
+      - "app/api/contact/**"
+      - "app/api/newsletter/**"
+      - "components/**"
+      - "lib/forms/**"
+      - "test/**"
+      - "package.json"
+      - "package-lock.json"
+      - "vitest.config.ts"
+      - ".github/workflows/public-form-delivery.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test

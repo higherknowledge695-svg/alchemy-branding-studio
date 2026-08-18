@@ -1,9 +1,15 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 
 import Button from "@/components/Button";
+import SubmissionError from "@/components/forms/SubmissionError";
+import type { PublicFormFailure } from "@/lib/forms/contracts";
+import {
+  navigateAfterConfirmedDelivery,
+  submitPublicForm,
+} from "@/lib/forms/client";
 
 type FieldErrors = Partial<
   Record<"name" | "email" | "company" | "website" | "challenge", string>
@@ -20,8 +26,13 @@ const labelBase =
 
 export default function AuditForm() {
   const [status, setStatus] = useState<Status>("idle");
-  const [serverError, setServerError] = useState<string | null>(null);
+  const [failure, setFailure] = useState<PublicFormFailure | null>(null);
   const [errors, setErrors] = useState<FieldErrors>({});
+  const errorRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (status === "error") errorRef.current?.focus();
+  }, [status]);
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -29,44 +40,26 @@ export default function AuditForm() {
     const form = event.currentTarget;
     setStatus("submitting");
     setErrors({});
-    setServerError(null);
+    setFailure(null);
 
     const data = new FormData(form);
     const payload = Object.fromEntries(data.entries());
 
-    try {
-      const res = await fetch("/api/audit", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const body = (await res.json()) as {
-        ok?: boolean;
-        error?: string;
-        fields?: FieldErrors;
-      };
+    const result = await submitPublicForm<keyof FieldErrors>(
+      "/api/audit",
+      payload,
+    );
 
-      if (!res.ok || body.error) {
-        setStatus("error");
-        if (body.fields) setErrors(body.fields);
-        setServerError(body.error ?? "Something went wrong. Please try again.");
-        return;
-      }
-      setStatus("success");
-      form.reset();
-      // Redirect to the dedicated thank-you page. A real pageview of
-      // /free-brand-audit-for-smes/thank-you is the reliable conversion
-      // signal for Google Ads; the inline success block below is a fallback
-      // if navigation is ever blocked.
-      window.location.assign("/free-brand-audit-for-smes/thank-you");
-    } catch (err) {
+    if (!result.ok) {
       setStatus("error");
-      setServerError(
-        err instanceof Error
-          ? err.message
-          : "Couldn't send the form. Please try again or email us.",
-      );
+      setFailure(result);
+      setErrors(result.error.fields ?? {});
+      return;
     }
+
+    setStatus("success");
+    form.reset();
+    navigateAfterConfirmedDelivery("/free-brand-audit-for-smes/thank-you");
   }
 
   if (status === "success") {
@@ -99,6 +92,7 @@ export default function AuditForm() {
       onSubmit={onSubmit}
       className="rounded-card bg-dawn-80 border border-dawn-60 p-7 space-y-5"
       noValidate
+      aria-busy={status === "submitting"}
     >
       <header>
         <p className="text-[0.75rem] font-bold uppercase tracking-[0.12em] text-dragon-fire">
@@ -224,17 +218,20 @@ export default function AuditForm() {
         </label>
       </div>
 
-      {serverError ? (
-        <p
-          role="alert"
+      {failure ? (
+        <SubmissionError
+          ref={errorRef}
+          failure={failure}
           className="text-[0.875rem] text-dragon-fire bg-dawn rounded-card p-3 border border-dragon-fire/40"
-        >
-          {serverError}
-        </p>
+        />
       ) : null}
 
       <Button variant="primary" type="submit" disabled={status === "submitting"} className="w-full">
-        {status === "submitting" ? "Sending…" : "Request my audit"}
+        {status === "submitting"
+          ? "Sending…"
+          : status === "error"
+            ? "Try again"
+            : "Request my audit"}
       </Button>
       <p className="text-[0.75rem] text-white/40 text-center">
         Free. No commitment. Three-business-day turnaround.

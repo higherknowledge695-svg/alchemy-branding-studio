@@ -1,9 +1,12 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 
 import Button from "@/components/Button";
+import SubmissionError from "@/components/forms/SubmissionError";
+import { submitPublicForm } from "@/lib/forms/client";
+import type { PublicFormFailure } from "@/lib/forms/contracts";
 
 const CHECKLIST_PATH = "/alchemy-brand-checklist.pdf";
 
@@ -23,14 +26,19 @@ function pushDataLayer(event: Record<string, unknown>) {
 
 export default function FooterNewsletter() {
   const [status, setStatus] = useState<Status>("idle");
-  const [serverError, setServerError] = useState<string | null>(null);
+  const [failure, setFailure] = useState<PublicFormFailure | null>(null);
   const [errors, setErrors] = useState<FieldErrors>({});
+  const errorRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (status === "error") errorRef.current?.focus();
+  }, [status]);
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setStatus("submitting");
     setErrors({});
-    setServerError(null);
+    setFailure(null);
 
     const data = new FormData(event.currentTarget);
     const payload = {
@@ -39,33 +47,19 @@ export default function FooterNewsletter() {
       company: String(data.get("company") ?? ""),
     };
 
-    try {
-      const res = await fetch("/api/newsletter", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const body = (await res.json()) as {
-        ok?: boolean;
-        error?: string;
-        fields?: FieldErrors;
-      };
-      if (!res.ok || body.error) {
-        setStatus("error");
-        if (body.fields) setErrors(body.fields);
-        setServerError(body.error ?? "Something went wrong. Please try again.");
-        return;
-      }
-      pushDataLayer({ event: "newsletter_signup", form_location: "footer" });
-      setStatus("success");
-    } catch (err) {
+    const result = await submitPublicForm<keyof FieldErrors>(
+      "/api/newsletter",
+      payload,
+    );
+    if (!result.ok) {
       setStatus("error");
-      setServerError(
-        err instanceof Error
-          ? err.message
-          : "Couldn't sign you up just then. Please try again.",
-      );
+      setFailure(result);
+      setErrors(result.error.fields ?? {});
+      return;
     }
+
+    pushDataLayer({ event: "newsletter_signup", form_location: "footer" });
+    setStatus("success");
   }
 
   return (
@@ -108,7 +102,12 @@ export default function FooterNewsletter() {
               </p>
             </div>
           ) : (
-            <form onSubmit={onSubmit} noValidate className="space-y-3">
+            <form
+              onSubmit={onSubmit}
+              noValidate
+              className="space-y-3"
+              aria-busy={status === "submitting"}
+            >
               <div className="flex flex-col sm:flex-row gap-3">
                 <input
                   name="email"
@@ -119,6 +118,7 @@ export default function FooterNewsletter() {
                   className={inputBase}
                   aria-label="Email"
                   aria-invalid={Boolean(errors.email)}
+                  aria-describedby={errors.email ? "footer-email-error" : undefined}
                 />
                 <Button
                   variant="primary"
@@ -126,7 +126,11 @@ export default function FooterNewsletter() {
                   disabled={status === "submitting"}
                   className="shrink-0"
                 >
-                  {status === "submitting" ? "Sending…" : "Send it over"}
+                  {status === "submitting"
+                    ? "Sending…"
+                    : status === "error"
+                      ? "Try again"
+                      : "Send it over"}
                 </Button>
               </div>
 
@@ -137,12 +141,26 @@ export default function FooterNewsletter() {
                   required
                   className="mt-0.5 size-4 shrink-0 accent-dragon-fire"
                   aria-invalid={Boolean(errors.consent)}
+                  aria-describedby={
+                    errors.consent ? "footer-consent-error" : undefined
+                  }
                 />
                 <span className="text-[0.75rem] leading-[1.5] text-white/45">
                   Email me the checklist and the occasional brand note. No spam,
                   unsubscribe anytime.
                 </span>
               </label>
+
+              {errors.email ? (
+                <p id="footer-email-error" className="text-[0.8rem] text-dragon-fire">
+                  {errors.email}
+                </p>
+              ) : null}
+              {errors.consent ? (
+                <p id="footer-consent-error" className="text-[0.8rem] text-dragon-fire">
+                  {errors.consent}
+                </p>
+              ) : null}
 
               {/* Honeypot */}
               <div
@@ -160,11 +178,13 @@ export default function FooterNewsletter() {
                 </label>
               </div>
 
-              {(errors.email || errors.consent || serverError) && (
-                <p role="alert" className="text-[0.8rem] text-dragon-fire">
-                  {serverError ?? errors.email ?? errors.consent}
-                </p>
-              )}
+              {failure ? (
+                <SubmissionError
+                  ref={errorRef}
+                  failure={failure}
+                  className="text-[0.8rem] text-dragon-fire"
+                />
+              ) : null}
             </form>
           )}
         </div>

@@ -1,135 +1,111 @@
-import { NextResponse } from "next/server";
+import {
+  deliveryFailureResponse,
+  failureResponse,
+  getRequestId,
+  logDeliveryFailure,
+  successResponse,
+} from "@/lib/forms/server";
+import {
+  deliverWithHubSpot,
+  getHubSpotConfig,
+} from "@/lib/forms/providers";
 
-/**
- * Newsletter signup endpoint for the homepage brand-checklist lead magnet.
- *
- * Mirrors the simulated-until-configured pattern used by /api/contact:
- * until the HubSpot env vars are present it validates the input and
- * returns { ok: true, simulated: true } so the form can be iterated on
- * without provisioning HubSpot. Once HUBSPOT_PORTAL_ID and
- * HUBSPOT_NEWSLETTER_FORM_GUID are set in Vercel, it forwards the email
- * to the HubSpot Forms Submissions API.
- */
-
-const PORTAL_ID = process.env.HUBSPOT_PORTAL_ID;
-const FORM_GUID = process.env.HUBSPOT_NEWSLETTER_FORM_GUID;
-const CONSENT_TEXT = process.env.HUBSPOT_CONSENT_TEXT;
-const NEWSLETTER_SUBSCRIPTION_ID = process.env.HUBSPOT_NEWSLETTER_SUBSCRIPTION_ID;
-// Data-residency region. This portal is on EU (app-eu1), so default to eu1.
-// na1 uses the global api.hsforms.com host; other regions use api-<region>.
-const REGION = process.env.HUBSPOT_FORMS_REGION || "eu1";
-const FORMS_HOST =
-  REGION === "na1" ? "api.hsforms.com" : `api-${REGION}.hsforms.com`;
-
-type NewsletterPayload = {
-  email?: string;
-  consent?: boolean | string;
-  /** Honeypot — must stay empty. */
-  company?: string;
-};
+type NewsletterField = "email" | "consent";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-function isConsented(value: NewsletterPayload["consent"]) {
+function isConsented(value: unknown) {
   return value === true || value === "true" || value === "on";
 }
 
+function readString(body: Record<string, unknown>, field: string) {
+  return typeof body[field] === "string" ? body[field].trim() : "";
+}
+
 export async function POST(request: Request) {
-  let body: NewsletterPayload;
+  const requestId = getRequestId(request);
+  const startedAt = Date.now();
+  let body: unknown;
+
   try {
-    body = (await request.json()) as NewsletterPayload;
+    body = await request.json();
   } catch {
-    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
-  }
-
-  // Honeypot — bots fill hidden fields, humans don't.
-  if (body.company && body.company.trim() !== "") {
-    return NextResponse.json({ ok: true });
-  }
-
-  const email = body.email?.trim() ?? "";
-
-  const errors: Record<string, string> = {};
-  if (!EMAIL_RE.test(email)) errors.email = "Please enter a valid email.";
-  if (!isConsented(body.consent)) {
-    errors.consent = "Please tick the box so we can email you the checklist.";
-  }
-
-  if (Object.keys(errors).length > 0) {
-    return NextResponse.json(
-      { error: "Invalid input", fields: errors },
-      { status: 422 },
+    return failureResponse(
+      requestId,
+      400,
+      "invalid_json",
+      "The request was not valid JSON.",
+      false,
     );
   }
 
-  if (!PORTAL_ID || !FORM_GUID) {
-    // Dev / unconfigured fallback — log and pretend it worked so the form
-    // can be iterated on before HubSpot is provisioned.
-    console.info("[newsletter] HubSpot env not set, skipping submission:", {
-      email,
-    });
-    return NextResponse.json({ ok: true, simulated: true });
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return failureResponse(
+      requestId,
+      400,
+      "invalid_json",
+      "The request was not valid JSON.",
+      false,
+    );
   }
 
-  const endpoint = `https://${FORMS_HOST}/submissions/v3/integration/submit/${PORTAL_ID}/${FORM_GUID}`;
+  const payload = body as Record<string, unknown>;
+  if (readString(payload, "company")) {
+    return failureResponse(
+      requestId,
+      422,
+      "invalid_input",
+      "The submitted details were not valid.",
+      false,
+    );
+  }
+
+  const email = readString(payload, "email");
+  const fields: Partial<Record<NewsletterField, string>> = {};
+  if (!EMAIL_RE.test(email)) fields.email = "Please enter a valid email.";
+  if (!isConsented(payload.consent)) {
+    fields.consent = "Please tick the box so we can email you the checklist.";
+  }
+
+  if (Object.keys(fields).length > 0) {
+    return failureResponse(
+      requestId,
+      422,
+      "invalid_input",
+      "Please check the highlighted fields.",
+      false,
+      fields,
+    );
+  }
+
+  const config = getHubSpotConfig();
+  if (!config) {
+    logDeliveryFailure({
+      requestId,
+      form: "newsletter",
+      provider: "hubspot",
+      code: "delivery_not_configured",
+      startedAt,
+    });
+    return failureResponse(
+      requestId,
+      503,
+      "delivery_not_configured",
+      "Newsletter signup is temporarily unavailable. Please try again later.",
+      true,
+    );
+  }
 
   try {
-    const res = await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        fields: [{ objectTypeId: "0-1", name: "email", value: email }],
-        // Record the visitor's on-site opt-in in HubSpot so the contact is
-        // logged as subscribed rather than "Not Specified". Requires
-        // HUBSPOT_CONSENT_TEXT; when HUBSPOT_NEWSLETTER_SUBSCRIPTION_ID is also
-        // set, the contact is explicitly opted in to that subscription type
-        // (the newsletter). Omitted entirely otherwise, so it stays safe on
-        // portals without the data-privacy feature (e.g. Starter plans).
-        ...(CONSENT_TEXT
-          ? {
-              legalConsentOptions: {
-                consent: {
-                  consentToProcess: true,
-                  text: CONSENT_TEXT,
-                  ...(NEWSLETTER_SUBSCRIPTION_ID
-                    ? {
-                        communications: [
-                          {
-                            value: true,
-                            subscriptionTypeId: Number(
-                              NEWSLETTER_SUBSCRIPTION_ID,
-                            ),
-                            text: CONSENT_TEXT,
-                          },
-                        ],
-                      }
-                    : {}),
-                },
-              },
-            }
-          : {}),
-        context: {
-          pageName: "Newsletter signup",
-          pageUri: "/",
-        },
-      }),
+    await deliverWithHubSpot({ config, email });
+    return successResponse(requestId);
+  } catch (error) {
+    return deliveryFailureResponse({
+      error,
+      requestId,
+      form: "newsletter",
+      provider: "hubspot",
+      startedAt,
     });
-
-    if (!res.ok) {
-      const detail = await res.text().catch(() => "");
-      console.error("[newsletter] HubSpot error:", res.status, detail);
-      return NextResponse.json(
-        { error: "Couldn't sign you up just then. Please try again." },
-        { status: 502 },
-      );
-    }
-
-    return NextResponse.json({ ok: true });
-  } catch (err) {
-    console.error("[newsletter] request failed:", err);
-    return NextResponse.json(
-      { error: "Couldn't sign you up just then. Please try again." },
-      { status: 502 },
-    );
   }
 }

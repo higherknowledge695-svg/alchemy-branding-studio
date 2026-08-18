@@ -1,29 +1,21 @@
-import { NextResponse } from "next/server";
-import { Resend } from "resend";
+import {
+  deliveryFailureResponse,
+  failureResponse,
+  getRequestId,
+  logDeliveryFailure,
+  successResponse,
+} from "@/lib/forms/server";
+import {
+  deliverWithResend,
+  getResendConfig,
+} from "@/lib/forms/providers";
 
-import { siteConfig } from "@/lib/site";
-
-const FROM_ADDRESS =
-  process.env.RESEND_FROM_EMAIL || "Alchemy Web <onboarding@resend.dev>";
-const TO_ADDRESS =
-  process.env.RESEND_AUDIT_TO_EMAIL ||
-  process.env.RESEND_TO_EMAIL ||
-  siteConfig.email;
-
-type AuditPayload = {
-  name?: string;
-  email?: string;
-  company?: string;
-  website?: string;
-  challenge?: string;
-  /** Honeypot — must stay empty. */
-  trap?: string;
-};
+type AuditField = "name" | "email" | "company" | "website" | "challenge";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-function escapeHtml(s: string) {
-  return s
+function escapeHtml(value: string) {
+  return value
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
@@ -31,75 +23,119 @@ function escapeHtml(s: string) {
     .replace(/'/g, "&#39;");
 }
 
+function readString(body: Record<string, unknown>, field: string) {
+  return typeof body[field] === "string" ? body[field].trim() : "";
+}
+
 export async function POST(request: Request) {
-  let body: AuditPayload;
+  const requestId = getRequestId(request);
+  const startedAt = Date.now();
+  let body: unknown;
+
   try {
-    body = (await request.json()) as AuditPayload;
+    body = await request.json();
   } catch {
-    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
+    return failureResponse(
+      requestId,
+      400,
+      "invalid_json",
+      "The request was not valid JSON.",
+      false,
+    );
   }
 
-  if (body.trap && body.trap.trim() !== "") {
-    return NextResponse.json({ ok: true });
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return failureResponse(
+      requestId,
+      400,
+      "invalid_json",
+      "The request was not valid JSON.",
+      false,
+    );
   }
 
-  const name = body.name?.trim() ?? "";
-  const email = body.email?.trim() ?? "";
-  const company = body.company?.trim() ?? "";
-  const website = body.website?.trim() ?? "";
-  const challenge = body.challenge?.trim() ?? "";
+  const payload = body as Record<string, unknown>;
+  if (readString(payload, "trap")) {
+    return failureResponse(
+      requestId,
+      422,
+      "invalid_input",
+      "The submitted details were not valid.",
+      false,
+    );
+  }
 
-  const errors: Record<string, string> = {};
-  if (name.length < 2) errors.name = "Please enter your name.";
-  if (!EMAIL_RE.test(email)) errors.email = "Please enter a valid email.";
-  if (company.length < 2) errors.company = "Which company is this for?";
-  if (website.length < 3) errors.website = "Drop your website URL so we can take a look.";
-  if (challenge.length < 10) errors.challenge = "Tell us a little more about what's not working.";
+  const name = readString(payload, "name");
+  const email = readString(payload, "email");
+  const company = readString(payload, "company");
+  const website = readString(payload, "website");
+  const challenge = readString(payload, "challenge");
 
-  if (Object.keys(errors).length > 0) {
-    return NextResponse.json({ error: "Invalid input", fields: errors }, { status: 422 });
+  const fields: Partial<Record<AuditField, string>> = {};
+  if (name.length < 2) fields.name = "Please enter your name.";
+  if (!EMAIL_RE.test(email)) fields.email = "Please enter a valid email.";
+  if (company.length < 2) fields.company = "Which company is this for?";
+  if (website.length < 3) {
+    fields.website = "Drop your website URL so we can take a look.";
+  }
+  if (challenge.length < 10) {
+    fields.challenge = "Tell us a little more about what's not working.";
+  }
+
+  if (Object.keys(fields).length > 0) {
+    return failureResponse(
+      requestId,
+      422,
+      "invalid_input",
+      "Please check the highlighted fields.",
+      false,
+      fields,
+    );
+  }
+
+  const config = getResendConfig("audit");
+  if (!config) {
+    logDeliveryFailure({
+      requestId,
+      form: "audit",
+      provider: "resend",
+      code: "delivery_not_configured",
+      startedAt,
+    });
+    return failureResponse(
+      requestId,
+      503,
+      "delivery_not_configured",
+      "Audit delivery is temporarily unavailable. Please try again later.",
+      true,
+    );
   }
 
   const subject = `Brand audit request: ${name} (${company})`;
-  const lines = [
+  const html = [
     `<p><strong>Name:</strong> ${escapeHtml(name)}</p>`,
     `<p><strong>Email:</strong> ${escapeHtml(email)}</p>`,
     `<p><strong>Company:</strong> ${escapeHtml(company)}</p>`,
     `<p><strong>Website:</strong> ${escapeHtml(website)}</p>`,
-  ];
-  lines.push(
     `<p><strong>Biggest brand or marketing challenge:</strong></p><p>${escapeHtml(challenge).replace(/\n/g, "<br />")}</p>`,
-  );
-  const html = lines.join("");
+  ].join("");
 
-  if (!process.env.RESEND_API_KEY) {
-    console.info("[audit] RESEND_API_KEY not set, skipping email send:", {
+  try {
+    await deliverWithResend({
+      config,
+      requestId,
+      replyTo: email,
       subject,
-      to: TO_ADDRESS,
-      from: FROM_ADDRESS,
-      name,
-      email,
-      company,
+      html,
     });
-    return NextResponse.json({ ok: true, simulated: true });
+    return successResponse(requestId);
+  } catch (error) {
+    return deliveryFailureResponse({
+      error,
+      requestId,
+      form: "audit",
+      provider: "resend",
+      startedAt,
+    });
   }
-
-  const resend = new Resend(process.env.RESEND_API_KEY);
-  const result = await resend.emails.send({
-    from: FROM_ADDRESS,
-    to: TO_ADDRESS,
-    replyTo: email,
-    subject,
-    html,
-  });
-
-  if (result.error) {
-    console.error("[audit] resend error:", result.error);
-    return NextResponse.json(
-      { error: "Failed to send. Please try again, or email us directly." },
-      { status: 502 },
-    );
-  }
-
-  return NextResponse.json({ ok: true, id: result.data?.id });
 }

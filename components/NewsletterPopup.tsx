@@ -5,6 +5,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 
 import Button from "@/components/Button";
+import SubmissionError from "@/components/forms/SubmissionError";
+import { submitPublicForm } from "@/lib/forms/client";
+import type { PublicFormFailure } from "@/lib/forms/contracts";
 
 const CHECKLIST_PATH = "/alchemy-brand-checklist.pdf";
 const STORAGE_KEY = "alchemy-checklist-popup";
@@ -58,10 +61,15 @@ export default function NewsletterPopup() {
   const pathname = usePathname();
   const [open, setOpen] = useState(false);
   const [status, setStatus] = useState<Status>("idle");
-  const [serverError, setServerError] = useState<string | null>(null);
+  const [failure, setFailure] = useState<PublicFormFailure | null>(null);
   const [errors, setErrors] = useState<FieldErrors>({});
   const dialogRef = useRef<HTMLDivElement>(null);
+  const errorRef = useRef<HTMLDivElement>(null);
   const convertedRef = useRef(false);
+
+  useEffect(() => {
+    if (status === "error") errorRef.current?.focus();
+  }, [status]);
 
   // Arm the scroll + dwell trigger.
   useEffect(() => {
@@ -145,7 +153,7 @@ export default function NewsletterPopup() {
     event.preventDefault();
     setStatus("submitting");
     setErrors({});
-    setServerError(null);
+    setFailure(null);
 
     const data = new FormData(event.currentTarget);
     const payload = {
@@ -154,36 +162,20 @@ export default function NewsletterPopup() {
       company: String(data.get("company") ?? ""),
     };
 
-    try {
-      const res = await fetch("/api/newsletter", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const body = (await res.json()) as {
-        ok?: boolean;
-        error?: string;
-        fields?: FieldErrors;
-      };
-
-      if (!res.ok || body.error) {
-        setStatus("error");
-        if (body.fields) setErrors(body.fields);
-        setServerError(body.error ?? "Something went wrong. Please try again.");
-        return;
-      }
-
-      convertedRef.current = true;
-      pushDataLayer({ event: "newsletter_signup", form_location: "popup" });
-      setStatus("success");
-    } catch (err) {
+    const result = await submitPublicForm<keyof FieldErrors>(
+      "/api/newsletter",
+      payload,
+    );
+    if (!result.ok) {
       setStatus("error");
-      setServerError(
-        err instanceof Error
-          ? err.message
-          : "Couldn't sign you up just then. Please try again.",
-      );
+      setFailure(result);
+      setErrors(result.error.fields ?? {});
+      return;
     }
+
+    convertedRef.current = true;
+    pushDataLayer({ event: "newsletter_signup", form_location: "popup" });
+    setStatus("success");
   }
 
   if (!open) return null;
@@ -252,7 +244,12 @@ export default function NewsletterPopup() {
               over.
             </p>
 
-            <form onSubmit={onSubmit} className="mt-6 space-y-4" noValidate>
+            <form
+              onSubmit={onSubmit}
+              className="mt-6 space-y-4"
+              noValidate
+              aria-busy={status === "submitting"}
+            >
               <div>
                 <input
                   data-autofocus
@@ -264,9 +261,10 @@ export default function NewsletterPopup() {
                   className={inputBase}
                   aria-label="Email"
                   aria-invalid={Boolean(errors.email)}
+                  aria-describedby={errors.email ? "popup-email-error" : undefined}
                 />
                 {errors.email ? (
-                  <p className="mt-2 text-[0.8rem] text-dragon-fire">
+                  <p id="popup-email-error" className="mt-2 text-[0.8rem] text-dragon-fire">
                     {errors.email}
                   </p>
                 ) : null}
@@ -279,6 +277,9 @@ export default function NewsletterPopup() {
                   required
                   className="mt-1 size-4 shrink-0 accent-dragon-fire"
                   aria-invalid={Boolean(errors.consent)}
+                  aria-describedby={
+                    errors.consent ? "popup-consent-error" : undefined
+                  }
                 />
                 <span className="text-[0.8125rem] leading-[1.5] text-white/60">
                   Email me the checklist and the occasional brand note. No spam,
@@ -286,7 +287,9 @@ export default function NewsletterPopup() {
                 </span>
               </label>
               {errors.consent ? (
-                <p className="text-[0.8rem] text-dragon-fire">{errors.consent}</p>
+                <p id="popup-consent-error" className="text-[0.8rem] text-dragon-fire">
+                  {errors.consent}
+                </p>
               ) : null}
 
               {/* Honeypot */}
@@ -305,13 +308,12 @@ export default function NewsletterPopup() {
                 </label>
               </div>
 
-              {serverError ? (
-                <p
-                  role="alert"
+              {failure ? (
+                <SubmissionError
+                  ref={errorRef}
+                  failure={failure}
                   className="text-[0.875rem] text-dragon-fire bg-dawn rounded-card p-3 border border-dragon-fire/40"
-                >
-                  {serverError}
-                </p>
+                />
               ) : null}
 
               <Button
@@ -320,7 +322,11 @@ export default function NewsletterPopup() {
                 disabled={status === "submitting"}
                 className="w-full"
               >
-                {status === "submitting" ? "Sending…" : "Send me the checklist"}
+                {status === "submitting"
+                  ? "Sending…"
+                  : status === "error"
+                    ? "Try again"
+                    : "Send me the checklist"}
               </Button>
             </form>
           </>

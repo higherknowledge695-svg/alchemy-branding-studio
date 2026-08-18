@@ -1,9 +1,15 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 
 import Button from "@/components/Button";
+import SubmissionError from "@/components/forms/SubmissionError";
+import type { PublicFormFailure } from "@/lib/forms/contracts";
+import {
+  navigateAfterConfirmedDelivery,
+  submitPublicForm,
+} from "@/lib/forms/client";
 
 const serviceOptions = [
   "Branding",
@@ -39,8 +45,13 @@ const labelBase =
 
 export default function ContactForm() {
   const [status, setStatus] = useState<Status>("idle");
-  const [serverError, setServerError] = useState<string | null>(null);
+  const [failure, setFailure] = useState<PublicFormFailure | null>(null);
   const [errors, setErrors] = useState<FieldErrors>({});
+  const errorRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (status === "error") errorRef.current?.focus();
+  }, [status]);
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -48,44 +59,26 @@ export default function ContactForm() {
     const form = event.currentTarget;
     setStatus("submitting");
     setErrors({});
-    setServerError(null);
+    setFailure(null);
 
     const data = new FormData(form);
     const payload = Object.fromEntries(data.entries());
 
-    try {
-      const res = await fetch("/api/contact", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const body = (await res.json()) as {
-        ok?: boolean;
-        error?: string;
-        fields?: FieldErrors;
-      };
+    const result = await submitPublicForm<keyof FieldErrors>(
+      "/api/contact",
+      payload,
+    );
 
-      if (!res.ok || body.error) {
-        setStatus("error");
-        if (body.fields) setErrors(body.fields);
-        setServerError(body.error ?? "Something went wrong. Please try again.");
-        return;
-      }
-      setStatus("success");
-      form.reset();
-      // Redirect to the dedicated thank-you page (the same URL the old site
-      // used). A real pageview of /contact/confirmation is the reliable
-      // conversion signal; the inline success block below is a fallback if
-      // navigation is ever blocked.
-      window.location.assign("/contact/confirmation");
-    } catch (err) {
+    if (!result.ok) {
       setStatus("error");
-      setServerError(
-        err instanceof Error
-          ? err.message
-          : "Couldn't send the form. Please try again or email us.",
-      );
+      setFailure(result);
+      setErrors(result.error.fields ?? {});
+      return;
     }
+
+    setStatus("success");
+    form.reset();
+    navigateAfterConfirmedDelivery("/contact/confirmation");
   }
 
   if (status === "success") {
@@ -113,7 +106,12 @@ export default function ContactForm() {
   }
 
   return (
-    <form onSubmit={onSubmit} className="space-y-6" noValidate>
+    <form
+      onSubmit={onSubmit}
+      className="space-y-6"
+      noValidate
+      aria-busy={status === "submitting"}
+    >
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         <div>
           <label htmlFor="name" className={labelBase}>
@@ -227,18 +225,21 @@ export default function ContactForm() {
         </label>
       </div>
 
-      {serverError ? (
-        <p
-          role="alert"
+      {failure ? (
+        <SubmissionError
+          ref={errorRef}
+          failure={failure}
           className="text-[0.875rem] text-dragon-fire bg-dawn-80 rounded-card p-3 border border-dragon-fire/40"
-        >
-          {serverError}
-        </p>
+        />
       ) : null}
 
       <div className="flex items-center gap-4">
         <Button variant="primary" type="submit" disabled={status === "submitting"}>
-          {status === "submitting" ? "Sending…" : "Send message"}
+          {status === "submitting"
+            ? "Sending…"
+            : status === "error"
+              ? "Try again"
+              : "Send message"}
         </Button>
         <p className="text-[0.8rem] text-white/40">
           We&apos;ll reply within one business day.
